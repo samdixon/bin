@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: project-dir [options] [query]
+
+Pick a directory under ~/projects with fzf and print its absolute path.
+
+Options:
+  -r, --root DIR       Project root directory (default: $PROJECT_DIR_ROOT or ~/projects)
+  -d, --depth N        Max directory depth below root (default: $PROJECT_DIR_DEPTH or 2)
+      --list           Print candidates without opening fzf
+      --no-preview     Disable the fzf preview pane
+  -h, --help           Show this help
+
+Environment:
+  PROJECT_DIR_ROOT             Default project root
+  PROJECT_DIR_DEPTH            Default max depth
+  PROJECT_DIR_FZF_HEIGHT       Default fzf height (40%)
+  PROJECT_DIR_FZF_LAYOUT       Default fzf layout (reverse)
+  PROJECT_DIR_FZF_PREVIEW      Set to 0 to disable preview
+  PROJECT_DIR_FZF_PREVIEW_WIN  Preview window option (right:60%:wrap)
+EOF
+}
+
+die() {
+  printf 'project-dir: %s\n' "$*" >&2
+  exit 1
+}
+
+root="${PROJECT_DIR_ROOT:-$HOME/projects}"
+depth="${PROJECT_DIR_DEPTH:-2}"
+list_only=0
+preview_enabled="${PROJECT_DIR_FZF_PREVIEW:-1}"
+query=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -r|--root)
+      [ "$#" -ge 2 ] || die "$1 requires a directory"
+      root="$2"
+      shift 2
+      ;;
+    --root=*)
+      root="${1#*=}"
+      shift
+      ;;
+    -d|--depth)
+      [ "$#" -ge 2 ] || die "$1 requires a number"
+      depth="$2"
+      shift 2
+      ;;
+    --depth=*)
+      depth="${1#*=}"
+      shift
+      ;;
+    --list)
+      list_only=1
+      shift
+      ;;
+    --no-preview)
+      preview_enabled=0
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      query="$*"
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      query="$*"
+      break
+      ;;
+  esac
+done
+
+case "$depth" in
+  ''|*[!0-9]*) die "depth must be a positive integer" ;;
+esac
+
+[ "$depth" -gt 0 ] || die "depth must be greater than zero"
+[ -d "$root" ] || die "project root does not exist: $root"
+
+if ! fzf_bin="$(command -v fzf 2>/dev/null)"; then
+  if [ -x "$HOME/.fzf/bin/fzf" ]; then
+    fzf_bin="$HOME/.fzf/bin/fzf"
+  else
+    die "fzf is not installed or not on PATH"
+  fi
+fi
+
+list_projects() {
+  find "$root" \
+    -mindepth 1 \
+    -maxdepth "$depth" \
+    \( \
+      -name .git \
+      -o -name .hg \
+      -o -name .svn \
+      -o -name node_modules \
+      -o -name .venv \
+      -o -name venv \
+      -o -name __pycache__ \
+      -o -name .terraform \
+      -o -name .serverless \
+      -o -name .next \
+      -o -name dist \
+      -o -name build \
+      -o -name target \
+    \) -prune \
+    -o -type d -print |
+    LC_ALL=C sort
+}
+
+if [ "$list_only" -eq 1 ]; then
+  list_projects
+  exit 0
+fi
+
+fzf_args=(
+  --height "${PROJECT_DIR_FZF_HEIGHT:-40%}"
+  --layout "${PROJECT_DIR_FZF_LAYOUT:-reverse}"
+  --border
+  --prompt 'project> '
+  --delimiter $'\t'
+  --with-nth 1
+  --query "$query"
+  --select-1
+  --exit-0
+)
+
+if [ "$preview_enabled" != 0 ]; then
+  fzf_args+=(
+    --preview 'dir={2}; printf "%s\n\n" "$dir"; if git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then git -C "$dir" status --short --branch 2>/dev/null | sed -n "1,25p"; printf "\n"; fi; ls -la "$dir" 2>/dev/null | sed -n "1,40p"'
+    --preview-window "${PROJECT_DIR_FZF_PREVIEW_WIN:-right:60%:wrap}"
+  )
+fi
+
+selection="$(
+  list_projects |
+    while IFS= read -r dir; do
+      rel="${dir#"$root"/}"
+      printf '%s\t%s\n' "$rel" "$dir"
+    done |
+    "$fzf_bin" "${fzf_args[@]}"
+)" || exit $?
+
+[ -n "$selection" ] || exit 1
+printf '%s\n' "${selection#*$'\t'}"

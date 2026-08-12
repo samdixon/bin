@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import boto3
+from dynamodb_json import json_util as ddb_json
+
+
+def get_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest='command', required=True)
+
+    clone_parser = subparsers.add_parser("clone", help="clone dynamodb table")
+    clone_parser.add_argument("-s", "--source", type=str, required=True, help="Source table or file. File should be in json format")
+    clone_parser.add_argument("-d", "--destination", type=str, help="Destination table or file. File should be in json format",)
+    clone_parser.add_argument("--aws-region", default="us-east-2",)
+    clone_parser.add_argument("--truncate-destination-table", action='store_true', default=False)
+    clone_parser.add_argument("--update-type", choices=['update', 'replace', "etl-update"], default='update',)
+
+    drop_keys_parser = subparsers.add_parser("drop-keys", help="Remove specified keys from all rows in dynamodb table")
+    drop_keys_parser.add_argument("--table", type=str, required=True)
+    drop_keys_parser.add_argument("-k", "--keys-to-drop", type=str, nargs="+", required=True)
+    drop_keys_parser.add_argument("--aws-region", default="us-east-2",)
+
+    map_tenant_to_brand_parser = subparsers.add_parser("map-tenant-to-brand", help="Manually map a tenant id to a brand id + product/locations")
+    map_tenant_to_brand_parser.add_argument("--tenant-id",type=str, required=True)
+    map_tenant_to_brand_parser.add_argument("--brand-id", type=str, required=True)
+    map_tenant_to_brand_parser.add_argument("--table", type=str, required=True)
+    map_tenant_to_brand_parser.add_argument("--aws-region", default="us-east-2")
+
+    parsed = parser.parse_args()
+    return parsed
+
+
+def validate_clone_inputs(args, client) -> tuple[str, str, str, str]:
+    if source_is_file(args.source):
+        source_type = 'file'
+    else:
+        source_type = 'table'
+
+    if len([x for x in client.list_tables()['TableNames'] if x == args.destination]) > 0:
+        dest_type = 'table'
+    else:
+        dest_type = 'file'
+
+    return (args.source, args.destination, source_type, dest_type)
+
+
+def source_is_file(source: str) -> bool:
+    if not os.path.exists(source):
+        return os.path.exists("{}.json".format(source))
+    else:
+        return True
+
+
+def dump_table(client: boto3.client, source_table: str) -> dict:
+    results = []
+    last_evaluated_key = None
+    print('Pulling items from {}'.format(source_table))
+    while True:
+        if last_evaluated_key:
+            response = client.scan(
+                TableName=source_table,
+                ExclusiveStartKey=last_evaluated_key
+            )
+        else:
+            response = client.scan(TableName=source_table)
+        last_evaluated_key = response.get('LastEvaluatedKey')
+
+        results.extend(response['Items'])
+
+        if not last_evaluated_key:
+            break
+    print('Successfully pulled {} items from {}'.format(len(results),source_table))
+    return results
+
+
+def truncateTable(table_name, region_name):
+    dynamo = boto3.resource('dynamodb', region_name=region_name)
+    table = dynamo.Table(table_name)
+
+    #get the table keys
+    tableKeyNames = [key.get("AttributeName") for key in table.key_schema]
+
+    #Only retrieve the keys for each item in the table (minimize data transfer)
+    projectionExpression = ", ".join('#' + key for key in tableKeyNames)
+    expressionAttrNames = {'#'+key: key for key in tableKeyNames}
+
+    counter = 0
+    page = table.scan(ProjectionExpression=projectionExpression, ExpressionAttributeNames=expressionAttrNames)
+    with table.batch_writer() as batch:
+        while page["Count"] > 0:
+            counter += page["Count"]
+            # Delete items in batches
+            for itemKeys in page["Items"]:
+                batch.delete_item(Key=itemKeys)
+            # Fetch the next page
+            if 'LastEvaluatedKey' in page:
+                page = table.scan(
+                    ProjectionExpression=projectionExpression, ExpressionAttributeNames=expressionAttrNames,
+                    ExclusiveStartKey=page['LastEvaluatedKey'])
+            else:
+                break
+    print(f"Deleted {counter}")
+
+
+def make_item(item):
+    return {'PutRequest': {'Item': item}}
+
+
+def split_for_batch_write(table_data, table_name):
+    items = [make_item(i) for i in table_data]
+    return [items[i : i + 25] for i in range(0, len(items), 25)]
+
+
+def push_scan_state(client: boto3.client, scan_data: list, destination_table: str):
+    print('Putting {} items to table {}'.format(len(scan_data), destination_table))
+    for item in split_for_batch_write(scan_data, destination_table):
+        client.batch_write_item(RequestItems={destination_table: item})
+    print('Successfully put {} to table {}'.format(len(scan_data), destination_table))
+
+
+def update_dict_ret(x, y):
+    x.update(y)
+    return x
+
+
+def update_records(source_table_data: dict, destination_table_data: dict):
+    source_j = ddb_json.loads(source_table_data)
+    dest_j = ddb_json.loads(destination_table_data)
+    source_index = {}
+    dest_index = {}
+    updated_records = []
+    
+    for x in source_j:
+        source_index['{}#{}'.format(x['pk'], x['sk'])] = x
+    for x in dest_j:
+        dest_index['{}#{}'.format(x['pk'], x['sk'])] = x
+
+    for x in source_index:
+        if x not in dest_index:
+            updated_records.append(source_index[x])
+        elif source_index[x] != dest_index[x]:
+            updated_records.append(update_dict_ret(dest_index[x], source_index[x]))
+        else:
+            continue
+    return [json.loads(ddb_json.dumps(x)) for x in updated_records]
+
+
+def remove_keys(data, keys_to_remove):
+    j_data = ddb_json.loads(data)
+    print('Cleaning {} items of key {}'.format(len(j_data), keys_to_remove))
+    for item in data:
+        for key in keys_to_remove:
+            if key in item:
+                del item[key]
+    return data
+
+
+def write_to_outfile(scan_table_results: list, destination_file: str) -> str:
+    if destination_file.endswith('.json') is not True:
+        destination_file = "{}.json".format(destination_file)
+    with open(destination_file, 'w') as f:
+        f.write(json.dumps(scan_table_results))
+    return destination_file
+
+
+def pull_tenant_items(client: boto3.client, table_name: str, brand_id: str):
+    brand = client.get_item(
+        TableName=table_name,
+        Key={
+            'pk': {'S': 'brand'},
+            'sk': {'S': brand_id}
+        })['Item']
+    brand_products = client.query(
+        TableName=table_name,
+        KeyConditionExpression=f"pk = :pk AND begins_with ( sk , :sk)",
+        ExpressionAttributeValues={
+            ':pk': {'S': f'brand#{brand_id}'},
+            ':sk': {'S': 'product'}
+        }
+    )['Items']
+    brand_locations = client.query(
+        TableName=table_name,
+        KeyConditionExpression=f"pk = :pk AND begins_with ( sk , :sk)",
+        ExpressionAttributeValues={
+            ':pk': {'S': f'brand#{brand_id}'},
+            ':sk': {'S': 'location'}
+        }
+    )['Items']
+    result = []
+    result.append(brand)
+    [result.append(x) for x in brand_products]
+    [result.append(x) for x in brand_locations]
+    return result
+
+
+def update_items_with_tenant(items: list, tenant_id: str):
+    buf = ddb_json.loads(items)
+    for x in buf:
+        x['tenantOwner'] = tenant_id
+    return [json.loads(ddb_json.dumps(x)) for x in buf]
+
+
+def clone_dynamo_table_main(args, client):
+    source, dest, source_type, dest_type = validate_clone_inputs(args, client)
+
+    if source_is_file(source):
+        with open(source, 'r') as f:
+            source_table_data = json.loads(f.read())
+            print('Loaded {} items from file {}'.format(len(source_table_data), source))
+    else:
+        source_table_data = dump_table(client, source)
+    try:
+        if dest_type == 'table':
+            if args.truncate_destination_table:
+                truncateTable(dest, args.aws_region)
+            if args.update_type == 'replace':
+                push_scan_state(client, source_table_data, dest)
+            else:
+                destination_table_data = dump_table(client, dest)
+                updated_records = update_records(source_table_data, destination_table_data)
+                with open('out.json', 'w') as f:
+                    f.write(json.dumps(updated_records))
+                push_scan_state(client, updated_records, dest)
+        else:
+            destination_file = write_to_outfile(source_table_data, dest)
+
+        print('copied {} {} to {} {}'.format(source_type, source, dest_type, dest))
+    except Exception as e:
+        print('Error during dynamodb clone')
+        print(e)
+
+
+def drop_dynamo_keys_main(args, client):
+    try:
+        table_data = dump_table(client, args.table)
+        cleaned_table_data = remove_keys(table_data, args.keys_to_drop)
+        push_scan_state(client, cleaned_table_data, args.table)
+    except Exception as e:
+        print('Error cleaning keys')
+        print(e)
+
+
+def map_tenant_to_brand_main(args, client):
+    try:
+        items_to_update = pull_tenant_items(client, args.table, args.brand_id)
+        items_with_tenant = update_items_with_tenant(items_to_update, args.tenant_id)
+        push_scan_state(client, items_with_tenant, args.table)
+    except Exception as e:
+        print('Error during tenant update')
+        print(e)
+
+
+def main():
+    args = get_args()
+    client = boto3.client('dynamodb', region_name=args.aws_region)
+    if args.command == "clone":
+        clone_dynamo_table_main(args, client)
+    elif args.command == "drop-keys":
+        drop_dynamo_keys_main(args, client)
+    elif args.command == "map-tenant-to-brand":
+        map_tenant_to_brand_main(args, client)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,119 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "boto3",
+# ]
+# ///
+"""Copy tags from one AWS resource to one or more others.
+
+Uses the Resource Groups Tagging API, so it works across most taggable
+resource types (S3 buckets, EC2 instances, Lambda functions, etc.) as
+long as you have ARNs for both sides.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+
+import boto3
+
+ARN_RE = re.compile(r"^arn:[^:]+:[^:]+:[^:]*:[^:]*:.+$")
+
+
+def arn_type(value: str) -> str:
+    if not ARN_RE.match(value):
+        raise argparse.ArgumentTypeError(
+            f"{value!r} does not look like a valid ARN (expected format: arn:partition:service:region:account-id:resource)"
+        )
+    return value
+
+
+def get_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source_arn", metavar="SOURCE_ARN", type=arn_type, help="ARN of the resource to copy tags from")
+    parser.add_argument("dest_arn", metavar="DEST_ARN", nargs="+", type=arn_type, help="ARN(s) of the resource(s) to copy tags to")
+    parser.add_argument("--edit", action="store_true", help="Open the tags as JSON in $EDITOR before applying them")
+    parser.add_argument("--dry-run", action="store_true", help="Print the tags that would be applied without applying them")
+    parser.add_argument("--region", help="AWS region (defaults to your AWS config/env)")
+    parser.add_argument("--profile", help="AWS profile to use")
+    return parser.parse_args()
+
+
+def get_tags(client, arn: str) -> dict:
+    resp = client.get_resources(ResourceARNList=[arn])
+    mappings = resp.get("ResourceTagMappingList", [])
+    if not mappings:
+        return {}
+    return {t["Key"]: t["Value"] for t in mappings[0].get("Tags", [])}
+
+
+def edit_tags(tags: dict) -> dict:
+    editor = os.environ.get("EDITOR", "vi")
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
+        json.dump(tags, tf, indent=2, sort_keys=True)
+        tf.write("\n")
+        path = tf.name
+
+    try:
+        subprocess.run(shlex.split(editor) + [path], check=True)
+
+        with open(path) as f:
+            content = f.read()
+
+        try:
+            edited = json.loads(content)
+        except json.JSONDecodeError as e:
+            print(f"Invalid JSON, aborting: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if not isinstance(edited, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in edited.items()
+        ):
+            print("Tags must be a JSON object mapping string keys to string values", file=sys.stderr)
+            sys.exit(1)
+
+        return edited
+    finally:
+        os.unlink(path)
+
+
+def tag_resources(client, arns: list[str], tags: dict) -> None:
+    if not tags:
+        print("No tags to apply, skipping")
+        return
+
+    resp = client.tag_resources(ResourceARNList=arns, Tags=tags)
+    failed = resp.get("FailedResourcesMap", {})
+    if failed:
+        for arn, info in failed.items():
+            print(f"Failed to tag {arn}: {info.get('ErrorMessage')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    args = get_args()
+
+    session = boto3.Session(profile_name=args.profile)
+    client = session.client("resourcegroupstaggingapi", region_name=args.region)
+
+    tags = get_tags(client, args.source_arn)
+    print(f"Found {len(tags)} tag(s) on {args.source_arn}")
+
+    if args.edit:
+        tags = edit_tags(tags)
+
+    if args.dry_run:
+        print(json.dumps(tags, indent=2, sort_keys=True))
+        return
+
+    tag_resources(client, args.dest_arn, tags)
+    print(f"Copied {len(tags)} tag(s) to {len(args.dest_arn)} resource(s)")
+
+
+if __name__ == "__main__":
+    main()

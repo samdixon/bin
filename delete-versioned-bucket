@@ -1,0 +1,45 @@
+#!/bin/bash
+
+if [ $# -ne 1 ]; then
+    echo "Usage: delete-versioned-bucket <bucket-name>"
+    exit 1
+fi
+
+BUCKET=$1
+
+echo "Deleting all versions and delete markers from bucket $BUCKET..."
+
+# Delete all versions
+aws s3api list-object-versions \
+    --bucket "$BUCKET" \
+    --output json \
+    --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+    | jq -c '.Objects[]' \
+    | while read -r object; do
+        key=$(echo "$object" | jq -r .Key)
+        version=$(echo "$object" | jq -r .VersionId)
+        aws s3api delete-object \
+            --bucket "$BUCKET" \
+            --key "$key" \
+            --version-id "$version"
+    done
+
+# Delete all delete markers
+aws s3api list-object-versions \
+    --bucket "$BUCKET" \
+    --output json \
+    --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+    | jq -c '.Objects[]' \
+    | while read -r object; do
+        key=$(echo "$object" | jq -r .Key)
+        version=$(echo "$object" | jq -r .VersionId)
+        aws s3api delete-object \
+            --bucket "$BUCKET" \
+            --key "$key" \
+            --version-id "$version"
+    done
+
+# Delete the bucket
+aws s3api delete-bucket --bucket "$BUCKET"
+
+echo "Bucket $BUCKET deleted successfully"
