@@ -1,0 +1,518 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["boto3>=1.34", "PyYAML>=6.0"]
+# ///
+"""cfnd - deploy a CloudFormation template from the CLI.
+
+    cfnd <template> [--stack-name NAME] [-p Key=Value ...] [--yes]
+
+Creates a change set, shows you what it will do, then asks before executing.
+Local Lambda code (Code: ./src) is zipped, uploaded to S3 and rewritten.
+"""
+
+import argparse
+import getpass
+import hashlib
+import io
+import json
+import os
+import re
+import sys
+import time
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+import boto3
+import botocore
+import yaml
+
+MAX_INLINE_TEMPLATE = 51_200
+SKIP_NAMES = {"__pycache__", ".git", ".DS_Store", ".pytest_cache", ".mypy_cache"}
+
+# Resource type -> property holding a code location, and how to rewrite it.
+PACKAGEABLE = {
+    "AWS::Lambda::Function": ("Code", "s3_props"),
+    "AWS::Lambda::LayerVersion": ("Content", "s3_props"),
+    "AWS::Serverless::Function": ("CodeUri", "s3_uri"),
+    "AWS::Serverless::LayerVersion": ("ContentUri", "s3_uri"),
+}
+
+TERMINAL_OK = {"CREATE_COMPLETE", "UPDATE_COMPLETE", "IMPORT_COMPLETE"}
+NEEDS_RECREATE = {"ROLLBACK_COMPLETE", "REVIEW_IN_PROGRESS"}
+
+
+# --------------------------------------------------------------------------- ui
+
+_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if _COLOR else str(text)
+
+
+def bold(t):
+    return c(t, "1")
+
+
+def dim(t):
+    return c(t, "2")
+
+
+def green(t):
+    return c(t, "32")
+
+
+def yellow(t):
+    return c(t, "33")
+
+
+def red(t):
+    return c(t, "31")
+
+
+def cyan(t):
+    return c(t, "36")
+
+
+def die(msg):
+    print(f"{red('error')} {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def info(msg):
+    print(f"{cyan('::')} {msg}")
+
+
+# ---------------------------------------------------------------------- parsing
+
+
+class CfnLoader(yaml.SafeLoader):
+    """SafeLoader that turns !Ref / !GetAtt / !Sub ... into their long forms."""
+
+
+def _intrinsic(loader, suffix, node):
+    if isinstance(node, yaml.ScalarNode):
+        value = loader.construct_scalar(node)
+    elif isinstance(node, yaml.SequenceNode):
+        value = loader.construct_sequence(node, deep=True)
+    else:
+        value = loader.construct_mapping(node, deep=True)
+
+    if suffix in ("Ref", "Condition"):
+        return {suffix: value}
+    if suffix == "GetAtt" and isinstance(value, str):
+        return {"Fn::GetAtt": value.split(".", 1)}
+    return {f"Fn::{suffix}": value}
+
+
+CfnLoader.add_multi_constructor("!", _intrinsic)
+
+
+def load_template(path: Path):
+    text = path.read_text()
+    try:
+        if path.suffix == ".json":
+            return json.loads(text), text
+        return yaml.load(text, Loader=CfnLoader), text
+    except (yaml.YAMLError, json.JSONDecodeError) as exc:
+        die(f"could not parse {path}: {exc}")
+
+
+def resolve_template(name: str) -> Path:
+    candidates = [Path(name)]
+    if not Path(name).suffix:
+        candidates += [Path(f"{name}{ext}") for ext in (".yaml", ".yml", ".json")]
+    search_dirs = [Path.cwd()]
+    if env_dir := os.environ.get("CFND_TEMPLATE_DIR"):
+        search_dirs.append(Path(env_dir).expanduser())
+    search_dirs.append(Path.cwd() / "templates")
+
+    for directory in search_dirs:
+        for cand in candidates:
+            if cand.is_absolute():
+                if cand.is_file():
+                    return cand
+                continue
+            path = directory / cand
+            if path.is_file():
+                return path
+    die(f"template not found: {name} (tried {', '.join(str(x) for x in candidates)})")
+
+
+def default_stack_name(path: Path) -> str:
+    name = re.sub(r"[^A-Za-z0-9-]+", "-", path.stem).strip("-")
+    if not name or not name[0].isalpha():
+        name = f"stack-{name}".strip("-")
+    return name[:128]
+
+
+# -------------------------------------------------------------------- packaging
+
+
+def zip_bytes(src: Path) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if src.is_file():
+            files = [(src, src.name)]
+        else:
+            files = []
+            for path in sorted(src.rglob("*")):
+                if any(part in SKIP_NAMES for part in path.parts):
+                    continue
+                if path.is_file() and path.suffix != ".pyc":
+                    files.append((path, path.relative_to(src).as_posix()))
+        for path, arcname in files:
+            zi = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+            zi.external_attr = (path.stat().st_mode & 0xFFFF) << 16
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(zi, path.read_bytes())
+    return buf.getvalue()
+
+
+class Uploader:
+    """Lazily resolves (and if needed creates) the artifact bucket."""
+
+    def __init__(self, session, bucket, region):
+        self.session = session
+        self._bucket = bucket
+        self.region = region
+        self.s3 = session.client("s3")
+        self._ready = False
+
+    @property
+    def bucket(self):
+        if not self._ready:
+            if not self._bucket:
+                account = self.session.client("sts").get_caller_identity()["Account"]
+                self._bucket = f"cfnd-artifacts-{account}-{self.region}"
+            self._ensure_bucket(self._bucket)
+            self._ready = True
+        return self._bucket
+
+    def _ensure_bucket(self, name):
+        try:
+            self.s3.head_bucket(Bucket=name)
+            return
+        except botocore.exceptions.ClientError as exc:
+            if exc.response["Error"]["Code"] not in ("404", "NoSuchBucket"):
+                die(f"cannot access s3://{name}: {exc}")
+        info(f"creating artifact bucket s3://{name}")
+        kwargs = {"Bucket": name}
+        if self.region != "us-east-1":
+            kwargs["CreateBucketConfiguration"] = {"LocationConstraint": self.region}
+        self.s3.create_bucket(**kwargs)
+        self.s3.put_public_access_block(
+            Bucket=name,
+            PublicAccessBlockConfiguration={
+                "BlockPublicAcls": True,
+                "IgnorePublicAcls": True,
+                "BlockPublicPolicy": True,
+                "RestrictPublicBuckets": True,
+            },
+        )
+
+    def put(self, key: str, data: bytes) -> str:
+        bucket = self.bucket
+        try:
+            self.s3.head_object(Bucket=bucket, Key=key)
+            print(dim(f"   cached  s3://{bucket}/{key}"))
+            return key
+        except botocore.exceptions.ClientError:
+            pass
+        self.s3.put_object(Bucket=bucket, Key=key, Body=data)
+        print(dim(f"   uploaded s3://{bucket}/{key} ({len(data) / 1024:.0f} KiB)"))
+        return key
+
+
+def package(template: dict, base_dir: Path, uploader: Uploader) -> bool:
+    """Rewrite local code paths to S3 locations. Returns True if anything changed."""
+    changed = False
+    for logical_id, resource in (template.get("Resources") or {}).items():
+        if not isinstance(resource, dict):
+            continue
+        spec = PACKAGEABLE.get(resource.get("Type"))
+        if not spec:
+            continue
+        prop, style = spec
+        props = resource.get("Properties") or {}
+        value = props.get(prop)
+        if not isinstance(value, str) or value.startswith(("s3://", "http://", "https://")):
+            continue
+
+        src = (base_dir / value).resolve()
+        if not src.exists():
+            die(f"{logical_id}: {prop} points at missing path {value}")
+
+        info(f"packaging {bold(logical_id)} from {value}")
+        data = src.read_bytes() if src.suffix == ".zip" else zip_bytes(src)
+        digest = hashlib.sha256(data).hexdigest()[:16]
+        key = f"cfnd/{logical_id}-{digest}.zip"
+        uploader.put(key, data)
+
+        if style == "s3_props":
+            props[prop] = {"S3Bucket": uploader.bucket, "S3Key": key}
+        else:
+            props[prop] = f"s3://{uploader.bucket}/{key}"
+        resource["Properties"] = props
+        changed = True
+    return changed
+
+
+# ------------------------------------------------------------------- parameters
+
+
+def resolve_parameters(template, overrides, existing, interactive):
+    declared = template.get("Parameters") or {}
+    if not declared:
+        if overrides:
+            die(f"template declares no parameters, got: {', '.join(overrides)}")
+        return []
+
+    unknown = set(overrides) - set(declared)
+    if unknown:
+        die(f"unknown parameter(s): {', '.join(sorted(unknown))}")
+
+    resolved, missing = [], []
+    for name, spec in declared.items():
+        if name in overrides:
+            resolved.append({"ParameterKey": name, "ParameterValue": overrides[name]})
+        elif name in existing:
+            resolved.append({"ParameterKey": name, "UsePreviousValue": True})
+        elif "Default" in spec:
+            continue  # let CloudFormation apply the default
+        elif interactive:
+            prompt = f"  {name}"
+            if desc := spec.get("Description"):
+                prompt += f" ({desc})"
+            reader = getpass.getpass if spec.get("NoEcho") in (True, "true") else input
+            resolved.append({"ParameterKey": name, "ParameterValue": reader(f"{prompt}: ")})
+        else:
+            missing.append(name)
+    if missing:
+        die(f"missing required parameter(s): {', '.join(missing)} (pass with -p Key=Value)")
+    return resolved
+
+
+# ----------------------------------------------------------------------- deploy
+
+
+def stack_state(cfn, stack_name):
+    try:
+        stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    except botocore.exceptions.ClientError as exc:
+        if "does not exist" in str(exc):
+            return None
+        raise
+    return stack
+
+
+def delete_stack(cfn, stack_name, stack_id):
+    info(f"deleting {stack_name} ({stack_id and 'previous failed create'})")
+    cfn.delete_stack(StackName=stack_id)
+    cfn.get_waiter("stack_delete_complete").wait(StackName=stack_id)
+
+
+def discard_change_set(cfn, change_set_id, stack_name, is_create):
+    """Drop a change set, and the empty shell stack a CREATE change set leaves behind."""
+    cfn.delete_change_set(ChangeSetName=change_set_id)
+    if not is_create:
+        return
+    stack = stack_state(cfn, stack_name)
+    if stack and stack["StackStatus"] == "REVIEW_IN_PROGRESS":
+        cfn.delete_stack(StackName=stack["StackId"])
+
+
+def print_plan(stack_name, region, account, template_path, params, changes, is_create):
+    verb = green("CREATE") if is_create else yellow("UPDATE")
+    print()
+    print(f"{bold('stack')}     {stack_name}  [{verb}]")
+    print(f"{bold('template')}  {template_path}")
+    print(f"{bold('account')}   {account}  {bold('region')} {region}")
+    if params:
+        print(bold("params"))
+        for p in params:
+            value = "<previous>" if p.get("UsePreviousValue") else p["ParameterValue"]
+            print(f"  {p['ParameterKey']} = {value}")
+    print(bold("changes"))
+    if not changes:
+        print(dim("  (none reported)"))
+    for change in changes:
+        rc = change["ResourceChange"]
+        action = rc["Action"]
+        color = {"Add": green, "Modify": yellow, "Remove": red, "Import": cyan}.get(action, str)
+        replacement = rc.get("Replacement", "")
+        note = red("  REPLACEMENT") if replacement == "True" else (
+            yellow("  conditional replacement") if replacement == "Conditional" else "")
+        scopes = ",".join(rc.get("Scope", []))
+        print(f"  {color(action.ljust(7))} {rc['LogicalResourceId']:<32} "
+              f"{dim(rc['ResourceType'])}{dim(' ' + scopes if scopes else '')}{note}")
+    print()
+
+
+def tail_events(cfn, stack_id, since):
+    seen = set()
+    while True:
+        pages = cfn.get_paginator("describe_stack_events").paginate(StackName=stack_id)
+        fresh = []
+        for page in pages:
+            for event in page["StackEvents"]:
+                if event["Timestamp"] < since:
+                    break
+                if event["EventId"] not in seen:
+                    fresh.append(event)
+            else:
+                continue
+            break
+        for event in reversed(fresh):
+            seen.add(event["EventId"])
+            status = event["ResourceStatus"]
+            color = red if "FAILED" in status or "ROLLBACK" in status else (
+                green if status.endswith("COMPLETE") else dim)
+            line = (f"  {event['Timestamp'].astimezone():%H:%M:%S} {color(status.ljust(24))} "
+                    f"{event['LogicalResourceId']}")
+            if reason := event.get("ResourceStatusReason"):
+                line += dim(f" - {reason}")
+            print(line)
+
+        status = cfn.describe_stacks(StackName=stack_id)["Stacks"][0]["StackStatus"]
+        if status.endswith(("_COMPLETE", "_FAILED")) and "IN_PROGRESS" not in status:
+            return status
+        time.sleep(3)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="cfnd", description="Deploy a CloudFormation template.")
+    parser.add_argument("template", help="template file (extension optional)")
+    parser.add_argument("--stack-name", "-n", help="defaults to the template filename")
+    parser.add_argument("--param", "-p", action="append", default=[], metavar="KEY=VALUE",
+                        help="parameter override (repeatable)")
+    parser.add_argument("--yes", "-y", action="store_true", help="skip the confirmation prompt")
+    parser.add_argument("--region", help="AWS region (default: profile/env)")
+    parser.add_argument("--profile", help="AWS profile")
+    parser.add_argument("--s3-bucket", default=os.environ.get("CFND_S3_BUCKET"),
+                        help="artifact bucket (default: cfnd-artifacts-<account>-<region>)")
+    parser.add_argument("--capabilities", nargs="*", default=None,
+                        help="default: IAM, NAMED_IAM and AUTO_EXPAND")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="show the change set and delete it without deploying")
+    args = parser.parse_args()
+
+    overrides = {}
+    for item in args.param:
+        if "=" not in item:
+            die(f"bad parameter {item!r}, expected KEY=VALUE")
+        key, value = item.split("=", 1)
+        overrides[key] = value
+
+    template_path = resolve_template(args.template)
+    stack_name = args.stack_name or default_stack_name(template_path)
+    template, raw = load_template(template_path)
+    if not isinstance(template, dict) or "Resources" not in template:
+        die(f"{template_path} does not look like a CloudFormation template")
+
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    region = session.region_name
+    if not region:
+        die("no region configured (pass --region or set AWS_REGION)")
+    cfn = session.client("cloudformation")
+    try:
+        account = session.client("sts").get_caller_identity()["Account"]
+    except botocore.exceptions.BotoCoreError as exc:
+        die(f"no usable AWS credentials: {exc}")
+
+    uploader = Uploader(session, args.s3_bucket, region)
+    body = raw if not package(template, template_path.parent, uploader) else json.dumps(
+        template, indent=1)
+
+    template_arg = {"TemplateBody": body}
+    if len(body.encode()) > MAX_INLINE_TEMPLATE:
+        key = f"cfnd/templates/{stack_name}-{hashlib.sha256(body.encode()).hexdigest()[:16]}.json"
+        uploader.put(key, body.encode())
+        template_arg = {"TemplateURL": f"https://{uploader.bucket}.s3.{region}.amazonaws.com/{key}"}
+
+    stack = stack_state(cfn, stack_name)
+    if stack and stack["StackStatus"] in NEEDS_RECREATE:
+        print(yellow(f"{stack_name} is in {stack['StackStatus']} and must be deleted first."))
+        if not (args.yes or input("delete it? [y/N] ").strip().lower() in ("y", "yes")):
+            die("aborted")
+        delete_stack(cfn, stack_name, stack["StackId"])
+        stack = None
+
+    existing = {p["ParameterKey"] for p in (stack or {}).get("Parameters", [])}
+    params = resolve_parameters(template, overrides, existing, sys.stdin.isatty())
+
+    capabilities = args.capabilities if args.capabilities is not None else [
+        "CAPABILITY_IAM", "CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"]
+
+    change_set_name = f"cfnd-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
+    is_create = stack is None
+    created = cfn.create_change_set(
+        StackName=stack_name,
+        ChangeSetName=change_set_name,
+        ChangeSetType="CREATE" if is_create else "UPDATE",
+        Parameters=params,
+        Capabilities=capabilities,
+        **template_arg,
+    )
+    change_set_id = created["Id"]
+
+    info("waiting for change set")
+    while True:
+        described = cfn.describe_change_set(ChangeSetName=change_set_id)
+        if described["Status"] in ("CREATE_COMPLETE", "FAILED"):
+            break
+        time.sleep(2)
+
+    if described["Status"] == "FAILED":
+        reason = described.get("StatusReason", "")
+        discard_change_set(cfn, change_set_id, stack_name, is_create)
+        if "didn't contain changes" in reason or "No updates" in reason:
+            print(green(f"{stack_name} is already up to date."))
+            return
+        die(f"change set failed: {reason}")
+
+    print_plan(stack_name, region, account, template_path,
+               params, described.get("Changes", []), is_create)
+
+    if args.dry_run:
+        discard_change_set(cfn, change_set_id, stack_name, is_create)
+        info("dry run - change set discarded")
+        return
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            die("refusing to deploy non-interactively without --yes")
+        if input(f"deploy to {bold(stack_name)}? [y/N] ").strip().lower() not in ("y", "yes"):
+            discard_change_set(cfn, change_set_id, stack_name, is_create)
+            die("aborted")
+
+    started = datetime.now(timezone.utc)
+    cfn.execute_change_set(ChangeSetName=change_set_id)
+    stack_id = described["StackId"]
+    status = tail_events(cfn, stack_id, started)
+
+    final = cfn.describe_stacks(StackName=stack_id)["Stacks"][0]
+    if outputs := final.get("Outputs"):
+        print(bold("\noutputs"))
+        width = max(len(o["OutputKey"]) for o in outputs)
+        for out in outputs:
+            print(f"  {out['OutputKey']:<{width}}  {out['OutputValue']}")
+
+    print()
+    if status in TERMINAL_OK:
+        print(green(f"{stack_name}: {status}"))
+    else:
+        print(red(f"{stack_name}: {status}"))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        die("interrupted")
+    except botocore.exceptions.ClientError as exc:
+        die(str(exc))
