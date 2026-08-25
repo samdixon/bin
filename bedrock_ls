@@ -1,0 +1,502 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["boto3>=1.40"]
+# ///
+"""bedrock-ls: grep-friendly listing of AWS Bedrock models, inference profiles,
+SageMaker endpoints, service URLs, and the per-model feature cards from the AWS docs.
+
+  bedrock-ls.py models                        foundation models in your region (API)
+  bedrock-ls.py models --full -g claude       + profile IDs, access status, doc features
+  bedrock-ls.py models --docs -g stream=n     which models can't stream?
+  bedrock-ls.py cards -g tools=y -g caching=y docs only, no AWS creds needed
+  bedrock-ls.py cards -g regions=us-east-1 -c name,model_id,context,max_out
+  bedrock-ls.py profiles -g claude            cross-region inference profile IDs (API)
+  bedrock-ls.py endpoints                     SageMaker endpoints + invoke URLs
+  bedrock-ls.py urls --all-regions            service endpoint URLs per region
+
+Sources: ListFoundationModels, ListInferenceProfiles, GetFoundationModelAvailability,
+SageMaker ListEndpoints (need creds); "Models at a glance" cards on docs.aws.amazon.com
+(cached 24h in ~/.cache/bedrock-ls, --refresh to refetch). y/n columns = supported/not,
+blank = docs don't say. -g filters are ANDed case-insensitive regex; col=RX scopes one column.
+Row count goes to stderr, so stdout stays pipe-clean.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import boto3
+from botocore.config import Config
+
+DOCS = "https://docs.aws.amazon.com/bedrock/latest/userguide/"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "bedrock-ls" / "cards.json"
+CACHE_TTL = 24 * 3600
+RETRY = Config(retries={"mode": "adaptive", "max_attempts": 10})
+SHORT = {"ON_DEMAND": "on-demand", "INFERENCE_PROFILE": "profile", "PROVISIONED": "provisioned",
+         "FINE_TUNING": "fine-tune", "CONTINUED_PRE_TRAINING": "cpt", "DISTILLATION": "distill"}
+
+
+def short(vals):
+    return "+".join(SHORT.get(v, v.lower()) for v in vals)
+
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+def arn_region(arn):
+    p = arn.split(":")
+    return p[3] if len(p) > 3 else ""
+
+
+def date(ts):
+    return ts.strftime("%Y-%m-%d") if ts else ""
+
+
+# --- API fetchers: (session, region, args) -> list[dict] ---------------------
+
+def fetch_models(sess, region, args):
+    c = sess.client("bedrock", region_name=region, config=RETRY)
+    rows = []
+    for m in c.list_foundation_models()["modelSummaries"]:
+        lc = m.get("modelLifecycle", {})
+        rows.append({
+            "region": region,
+            "provider": m.get("providerName", ""),
+            "model_id": m["modelId"],
+            "name": m.get("modelName", ""),
+            "input": short(m.get("inputModalities", [])),
+            "output": short(m.get("outputModalities", [])),
+            "stream": "y" if m.get("responseStreamingSupported") else "n",
+            "inference": short(m.get("inferenceTypesSupported", [])),
+            "custom": short(m.get("customizationsSupported", [])),
+            "status": lc.get("status", "").lower(),
+            "eol": date(lc.get("endOfLifeTime")),
+            "arn": m["modelArn"],
+        })
+    if args.profiles:
+        by_model = {}
+        for p in fetch_profiles(sess, region, args, "SYSTEM_DEFINED"):
+            for mid in p["base_model"].split("+"):
+                by_model.setdefault(mid, []).append(p["profile_id"])
+        for r in rows:
+            r["profiles"] = ",".join(sorted(by_model.get(r["model_id"], [])))
+    if args.access:
+        def avail(r):
+            try:
+                a = c.get_foundation_model_availability(modelId=r["model_id"])
+                bad = []
+                st = a.get("agreementAvailability", {}).get("status", "")
+                if st != "AVAILABLE":
+                    bad.append("agreement-" + (st.lower().replace("_", "-") or "unknown"))
+                if a.get("authorizationStatus") != "AUTHORIZED":
+                    bad.append("not-authorized")
+                if a.get("entitlementAvailability") != "AVAILABLE":
+                    bad.append("not-entitled")
+                if a.get("regionAvailability") != "AVAILABLE":
+                    bad.append("not-in-region")
+                r["access"] = "+".join(bad) or "ok"
+            except Exception as e:  # noqa: BLE001
+                r["access"] = "err:" + type(e).__name__
+        with ThreadPoolExecutor(8) as ex:
+            list(ex.map(avail, rows))
+    if args.docs:
+        for r in rows:
+            card = match_card(r["model_id"], args.card_idx) or {}
+            for col in JOIN_COLS:
+                r[col] = card.get(col, "")
+            r["reach"] = next((k for k, col in (("in-region", "regions"), ("geo", "geo_regions"),
+                                                 ("global", "global_regions"))
+                               if region in card.get(col, "").split(",")), "")
+    return rows
+
+
+def fetch_profiles(sess, region, args, ptype=None):
+    c = sess.client("bedrock", region_name=region, config=RETRY)
+    ptype = ptype or ("APPLICATION" if args.app_profiles else "SYSTEM_DEFINED")
+    rows, token = [], None
+    while True:
+        resp = c.list_inference_profiles(typeEquals=ptype, **({"nextToken": token} if token else {}))
+        for p in resp.get("inferenceProfileSummaries", []):
+            arns = [x["modelArn"] for x in p.get("models", [])]
+            rows.append({
+                "region": region,
+                "profile_id": p["inferenceProfileId"],
+                "name": p.get("inferenceProfileName", ""),
+                "base_model": "+".join(sorted({a.rsplit("/", 1)[-1] for a in arns})),
+                "routes_to": ",".join(sorted({arn_region(a) for a in arns})),
+                "status": p.get("status", "").lower(),
+                "type": p.get("type", "").lower(),
+                "arn": p["inferenceProfileArn"],
+            })
+        token = resp.get("nextToken")
+        if not token:
+            return rows
+
+
+def fetch_endpoints(sess, region, args):
+    c = sess.client("sagemaker", region_name=region)
+    runtime = sess.client("sagemaker-runtime", region_name=region).meta.endpoint_url
+    rows = []
+    for page in c.get_paginator("list_endpoints").paginate():
+        for e in page.get("Endpoints", []):
+            rows.append({
+                "region": region,
+                "endpoint": e["EndpointName"],
+                "status": e.get("EndpointStatus", ""),
+                "created": date(e.get("CreationTime")),
+                "invoke_url": f"{runtime}/endpoints/{e['EndpointName']}/invocations",
+                "arn": e["EndpointArn"],
+            })
+    return rows
+
+
+def fetch_urls(sess, region, args):
+    svcs = ("bedrock", "bedrock-runtime", "bedrock-agent-runtime", "sagemaker-runtime")
+    return [{"region": region, "service": s, "url": sess.client(s, region_name=region).meta.endpoint_url}
+            for s in svcs]
+
+
+# --- docs model cards ---------------------------------------------------------
+
+ICON = re.compile(r"!\[[^\]]*\]\([^)]*icon-(yes|no)\.png\)")
+IMG = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+BR = re.compile(r"<br\s*/?>")
+
+DOC_COLS = ["provider", "name", "model_id", "mantle_id", "endpoints", "apis", "input", "output",
+            "stream", "tools", "server_tools", "structured", "guardrails", "computer_use",
+            "caching", "cache_ttl", "reasoning", "context", "max_out", "cutoff", "launch", "eol",
+            "lifecycle", "tiers", "geo_ids", "global_id", "regions", "geo_regions", "global_regions",
+            "price_in", "price_out", "features", "card"]
+# columns copied onto API model rows by --docs (API is authoritative for the rest)
+JOIN_COLS = [c for c in DOC_COLS if c not in
+             {"provider", "name", "model_id", "input", "output", "stream", "eol", "lifecycle"}]
+DOC_DEFAULT_JOIN = ["reach", "apis", "tools", "structured", "caching", "reasoning", "context", "max_out"]
+
+
+def http_get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "bedrock-ls/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def clean(cell):
+    """Markdown table cell -> plain text: drop images/icons, links -> label, strip bullet marker."""
+    text = LINK.sub(r"\1", IMG.sub("", cell)).replace("`", "").replace("**", "").replace("\\+", "+")
+    return re.sub(r"^\+ ", "", re.sub(r"\s+", " ", text).strip())
+
+
+def yn(cell):
+    m = ICON.search(cell)
+    if m:
+        return "y" if m.group(1) == "yes" else "n"
+    return {"yes": "y", "no": "n", "supported": "y", "not supported": "n"}.get(clean(cell).lower(), "")
+
+
+def flags(cell):
+    """'![icon-yes] [Label](..)<br />![icon-no] Other' -> [('Label','y'), ('Other','n')]"""
+    return [(clean(i), yn(i)) for i in BR.split(cell) if ICON.search(i) and clean(i)]
+
+
+def md_tables(md):
+    """Yield (header_cells_lowercased, [row_cells, ...]) for each pipe table."""
+    lines, i = md.splitlines(), 0
+    split = lambda ln: [c.strip() for c in ln.strip().strip("|").split("|")]  # noqa: E731
+    while i < len(lines):
+        if lines[i].lstrip().startswith("|") and i + 1 < len(lines) and re.match(r"\s*\|\s*:?-", lines[i + 1]):
+            hdr, rows, i = split(lines[i]), [], i + 2
+            while i < len(lines) and lines[i].lstrip().startswith("|"):
+                rows.append(split(lines[i]))
+                i += 1
+            yield [clean(h).lower() for h in hdr], rows
+        else:
+            i += 1
+
+
+def parse_card(md, provider, url):
+    r = {c: "" for c in DOC_COLS}
+    r["provider"], r["card"] = provider, url
+    m = re.search(r"^# (.+)$", md, re.M)
+    r["name"] = clean(m.group(1)) if m else ""
+    det = {clean(k).lower(): clean(v) for k, v in re.findall(r"^[+*-] \*\*(.+?):\*\*\s*(.*)$", md, re.M)}
+    na = lambda v: "" if v.upper() == "N/A" else v  # noqa: E731
+    r["launch"], r["eol"] = na(det.get("model launch date", "")), na(det.get("model eol date", ""))
+    r["lifecycle"] = det.get("model lifecycle", "").lower()
+    r["context"] = na(det.get("context window", "")).replace(" tokens", "")
+    r["max_out"] = na(det.get("max output tokens", ""))
+    r["reasoning"] = yn(det.get("reasoning", ""))
+    r["cutoff"] = na(det.get("knowledge cutoff", ""))
+    feats, ids = {}, {}
+    regions = {"regions": set(), "geo_regions": set(), "global_regions": set()}
+    for h, rows in md_tables(md):
+        if "input modalities" in h:
+            for i, name in enumerate(h):
+                yes = [lab for row in rows if i < len(row) for lab, v in flags(row[i]) if v == "y"]
+                if name == "input modalities":
+                    r["input"] = "+".join(x.lower() for x in yes)
+                elif name == "output modalities":
+                    r["output"] = "+".join(x.lower() for x in yes)
+                elif name.startswith("apis supported"):
+                    r["apis"] = "+".join(slug(x) for x in yes)
+                elif name.startswith("endpoints supported"):
+                    r["endpoints"] = "+".join(x.replace("bedrock-", "") for x in yes)
+        elif h[:2] == ["supported", "not supported"]:
+            for row in rows:
+                for cell in row:
+                    feats.update(flags(cell))
+        elif h and h[0].startswith("prompt caching supported") and rows:
+            r["caching"] = yn(rows[0][0])
+            r["cache_ttl"] = clean(rows[0][3]) if len(rows[0]) > 3 else ""
+        elif "model id" in h and "endpoint" in h:
+            for row in rows:
+                d = dict(zip(h, row))
+                ids[clean(d.get("endpoint", ""))] = clean(d.get("model id", ""))
+                geo = [clean(x) for x in BR.split(d.get("geo inference id", ""))]
+                geo = [x for x in geo if x and "not supported" not in x.lower()]
+                if geo:
+                    r["geo_ids"] = ",".join(geo)
+                g = clean(d.get("global inference id", ""))
+                if g and "not supported" not in g.lower():
+                    r["global_id"] = g
+        elif h[:4] == ["standard", "priority", "flex", "reserved"] and rows:
+            r["tiers"] = "+".join(n for n, c in zip(h, rows[0]) if yn(c) == "y")
+        elif h[:2] == ["region", "in-region"]:
+            for row in rows:
+                code = clean(row[0]).split(" ")[0]
+                for key, cell in zip(("regions", "geo_regions", "global_regions"), row[1:4]):
+                    if yn(cell) == "y":
+                        regions[key].add(code)
+        elif h and h[0] == "inference option":
+            for row in rows:
+                d = dict(zip(h, row))
+                if clean(d.get("inference option", "")).lower() == "in-region":
+                    r["price_in"], r["price_out"] = clean(d.get("input", "")), clean(d.get("output", ""))
+    r["model_id"] = ids.get("bedrock-runtime") or ids.get("bedrock-mantle", "")
+    r["mantle_id"] = ids.get("bedrock-mantle", "")
+    r["endpoints"] = r["endpoints"] or "+".join(k.replace("bedrock-", "") for k in ids)
+    for key, val in regions.items():
+        r[key] = ",".join(sorted(val))
+    lf = {k.lower(): v for k, v in feats.items()}
+    pick = lambda *names: next((lf[n] for n in names if n in lf), "")  # noqa: E731
+    r["stream"] = pick("response streaming")
+    r["tools"] = pick("client-side tool calling", "tool use")
+    r["server_tools"] = pick("server-side tool calling")
+    r["structured"] = pick("structured outputs")
+    r["guardrails"] = pick("guardrails")
+    r["computer_use"] = pick("computer use")
+    r["features"] = "+".join(slug(k) for k, v in sorted(feats.items()) if v == "y")
+    return r
+
+
+def load_cards(refresh=False):
+    if not refresh and CACHE.exists() and time.time() - CACHE.stat().st_mtime < CACHE_TTL:
+        return json.loads(CACHE.read_text())
+    links = {}
+    for h, rows in md_tables(http_get(DOCS + "model-cards.md")):
+        if "provider" in h and "supported models" in h:
+            for row in rows:
+                d = dict(zip(h, row))
+                for link in re.findall(r"\((model-card-[^)\s]+\.md)\)", d.get("supported models", "")):
+                    links.setdefault(link, clean(d.get("provider", "")))
+    if not links:
+        raise RuntimeError(f"no model cards found at {DOCS}model-cards.md (page layout changed?)")
+    print(f"fetching {len(links)} model cards from docs...", file=sys.stderr)
+
+    def one(item):
+        link, provider = item
+        try:
+            return parse_card(http_get(DOCS + link), provider, DOCS + link[:-3] + ".html"), None
+        except Exception as e:  # noqa: BLE001
+            return None, f"warn: {link}: {type(e).__name__}: {e}"
+
+    with ThreadPoolExecutor(16) as ex:
+        results = list(ex.map(one, links.items()))
+    for _, err in results:
+        if err:
+            print(err, file=sys.stderr)
+    cards = [r for r, _ in results if r]
+    try:
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE.write_text(json.dumps(cards))
+    except OSError as e:
+        print(f"warn: cache: {e}", file=sys.stderr)
+    return cards
+
+
+def card_index(cards):
+    idx = {}
+    for c in cards:
+        for k in (c["model_id"], c["mantle_id"]):
+            if k:
+                idx.setdefault(k.lower(), c)
+    return idx
+
+
+def match_card(model_id, idx):
+    """Exact model ID, else without the ':N' version suffix, else longest card ID that prefixes it."""
+    mid = model_id.lower()
+    for key in (mid, re.sub(r":\d+$", "", mid)):
+        if key in idx:
+            return idx[key]
+    cands = [k for k in idx if mid.startswith(k) and mid[len(k):len(k) + 1] in ("-", ":", ".")]
+    return idx[max(cands, key=len)] if cands else None
+
+
+# --- specs ----------------------------------------------------------------------
+
+API_MODEL_COLS = ["region", "provider", "model_id", "name", "input", "output", "stream", "inference",
+                  "custom", "status", "eol", "arn"]
+# what -> (fetcher, all columns, default columns, default sort)
+SPECS = {
+    "models": (fetch_models, API_MODEL_COLS + ["profiles", "access", "reach"] + JOIN_COLS,
+               ["provider", "model_id", "name", "input", "output", "stream", "inference", "status"],
+               ["provider", "model_id"]),
+    "cards": (None, DOC_COLS,
+              ["provider", "name", "model_id", "endpoints", "apis", "stream", "tools", "structured",
+               "caching", "reasoning", "context", "max_out"],
+              ["provider", "name"]),
+    "profiles": (fetch_profiles,
+                 ["region", "profile_id", "name", "base_model", "routes_to", "status", "type", "arn"],
+                 ["profile_id", "name", "routes_to", "status"],
+                 ["profile_id"]),
+    "endpoints": (fetch_endpoints,
+                  ["region", "endpoint", "status", "created", "invoke_url", "arn"],
+                  ["endpoint", "status", "created", "invoke_url"],
+                  ["endpoint"]),
+    "urls": (fetch_urls,
+             ["region", "service", "url"],
+             ["region", "service", "url"],
+             ["region", "service"]),
+}
+
+
+def render(rows, cols, fmt, header):
+    if fmt == "json":
+        json.dump([{c: r.get(c, "") for c in cols} for r in rows], sys.stdout, indent=2, default=str)
+        print()
+        return
+    cells = [[str(r.get(c, "")) for c in cols] for r in rows]
+    if fmt == "tsv":
+        if header:
+            print("\t".join(cols))
+        for row in cells:
+            print("\t".join(row))
+        return
+    widths = [max([len(c)] + [len(row[i]) for row in cells]) for i, c in enumerate(cols)]
+
+    def line(vals):
+        return "  ".join(v.ljust(w) for v, w in zip(vals, widths)).rstrip()
+
+    if header:
+        print(line(cols))
+        print(line(["-" * w for w in widths]))
+    for row in cells:
+        print(line(row))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="bedrock-ls", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("what", choices=list(SPECS), help="what to list")
+    ap.add_argument("--region", action="append", metavar="R", help="AWS region (repeatable); default: session region")
+    ap.add_argument("--all-regions", action="store_true", help="every region that has Bedrock")
+    ap.add_argument("--aws-profile", metavar="NAME", help="AWS credentials profile")
+    ap.add_argument("-g", "--grep", action="append", default=[], metavar="RX",
+                    help="filter rows; repeatable (AND); col=RX scopes to a column")
+    ap.add_argument("-s", "--sort", metavar="COL")
+    ap.add_argument("-r", "--reverse", action="store_true")
+    ap.add_argument("-c", "--columns", metavar="A,B,..")
+    ap.add_argument("-w", "--wide", action="store_true", help="show all columns")
+    ap.add_argument("-f", "--format", choices=["table", "tsv", "json"], default="table")
+    ap.add_argument("-H", "--no-header", action="store_true")
+    ap.add_argument("--list-columns", action="store_true", help="print column names and exit")
+    ap.add_argument("--refresh", action="store_true", help="refetch docs model cards (ignore 24h cache)")
+    ap.add_argument("--app-profiles", action="store_true", help="profiles: APPLICATION instead of SYSTEM_DEFINED")
+    x = ap.add_argument_group("models: extra columns")
+    x.add_argument("--profiles", action="store_true", help="+profiles: inference profile IDs that route to the model")
+    x.add_argument("--access", action="store_true", help="+access: can this account call it here? (1 API call/model)")
+    x.add_argument("--docs", action="store_true", help="+features joined from the docs model cards")
+    x.add_argument("--full", action="store_true", help="all three")
+    args = ap.parse_args()
+    if args.full:
+        args.profiles = args.access = args.docs = True
+
+    fetch, all_cols, default_cols, default_sort = SPECS[args.what]
+    if args.what == "models":
+        default_cols = (default_cols + (["profiles"] if args.profiles else []) + (["access"] if args.access else [])
+                        + (DOC_DEFAULT_JOIN if args.docs else []))
+    if args.list_columns:
+        print(" ".join(all_cols))
+        return
+    want_cols = [c.strip() for c in args.columns.split(",")] if args.columns else []
+    for c in ([args.sort] if args.sort else []) + want_cols:
+        if c not in all_cols:
+            sys.exit(f"unknown column {c!r}; columns: {' '.join(all_cols)}")
+
+    if args.what == "cards":
+        rows, regions = load_cards(args.refresh), []
+    else:
+        sess = boto3.Session(profile_name=args.aws_profile)
+        if args.all_regions:
+            regions = sess.get_available_regions("bedrock")
+        elif args.region:
+            regions = args.region
+        elif sess.region_name:
+            regions = [sess.region_name]
+        else:
+            sys.exit("no region: pass --region or set AWS_DEFAULT_REGION")
+        if args.what == "models" and args.docs:
+            args.card_idx = card_index(load_cards(args.refresh))
+
+        def one(region):
+            try:
+                return fetch(sess, region, args), None
+            except Exception as e:  # noqa: BLE001 - report per-region, keep going
+                return [], f"warn: {region}: {type(e).__name__}: {e}"
+
+        with ThreadPoolExecutor(max_workers=min(16, len(regions))) as ex:
+            results = list(ex.map(one, regions))
+        rows = [r for got, _ in results for r in got]
+        for _, err in results:
+            if err:
+                print(err, file=sys.stderr)
+
+    for pat in args.grep:
+        col, eq, rx = pat.partition("=")
+        if eq and col in all_cols:
+            r = re.compile(rx, re.I)
+            rows = [x for x in rows if r.search(str(x.get(col, "")))]
+        else:
+            r = re.compile(pat, re.I)
+            rows = [x for x in rows if any(r.search(str(v)) for v in x.values())]
+
+    sort_by = [args.sort] if args.sort else default_sort
+    rows.sort(key=lambda x: tuple(str(x.get(c, "")).lower() for c in sort_by), reverse=args.reverse)
+
+    if want_cols:
+        cols = want_cols
+    elif args.wide:
+        cols = all_cols
+    else:
+        cols = (["region"] if len(regions) > 1 and "region" not in default_cols else []) + default_cols
+    render(rows, cols, args.format, not args.no_header)
+    print(f"{len(rows)} rows", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
