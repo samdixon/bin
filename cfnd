@@ -77,6 +77,7 @@ def cyan(t):
 
 
 def die(msg):
+    sys.stdout.flush()  # keep the error after whatever we already printed
     print(f"{red('error')} {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -351,6 +352,61 @@ def print_plan(stack_name, region, account, template_path, params, changes, is_c
     print()
 
 
+def event_reason(event):
+    """Best human-readable reason on a stack or operation event."""
+    for key in ("ValidationStatusReason", "HookStatusReason", "ResourceStatusReason"):
+        if reason := event.get(key):
+            return reason
+    return ""
+
+
+def failed_events(cfn, change_set_id):
+    """Per-resource failure detail for a change set (early validation, hooks).
+
+    The change set's StatusReason only names the hook that failed; DescribeEvents
+    is where the actual property-level complaint lives.
+    """
+    events, seen, token = [], set(), None
+    while True:
+        kwargs = {"ChangeSetName": change_set_id, "Filters": {"FailedEvents": True}}
+        if token:
+            kwargs["NextToken"] = token
+        try:
+            page = cfn.describe_events(**kwargs)
+        except (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError,
+                AttributeError):
+            return events  # older botocore, or no permission - fall back to StatusReason
+        for event in page.get("OperationEvents", []):
+            if event.get("EventId") not in seen:
+                seen.add(event.get("EventId"))
+                events.append(event)
+        if not (token := page.get("NextToken")):
+            return events
+
+
+def print_failures(events):
+    if not events:
+        return
+    print(bold("failures"))
+    for event in events:
+        label = (event.get("ValidationName") or event.get("HookType")
+                 or event.get("ResourceStatus") or "FAILED")
+        line = f"  {red(label)}"
+        if logical_id := event.get("LogicalResourceId"):
+            line += f"  {bold(logical_id)}"
+        if resource_type := event.get("ResourceType"):
+            line += dim(f" {resource_type}")
+        if path := event.get("ValidationPath"):
+            # /Resources/<LogicalId>/Properties/Foo/Bar -> Foo/Bar; the logical id is
+            # already on this line and the prefix is the same for every finding.
+            prefix = f"/Resources/{event.get('LogicalResourceId')}/Properties/"
+            line += dim(f" at {path[len(prefix):] if path.startswith(prefix) else path}")
+        print(line)
+        for text in event_reason(event).splitlines():
+            print(f"    {text}")
+    print()
+
+
 def tail_events(cfn, stack_id, since):
     seen = set()
     while True:
@@ -367,12 +423,14 @@ def tail_events(cfn, stack_id, since):
             break
         for event in reversed(fresh):
             seen.add(event["EventId"])
-            status = event["ResourceStatus"]
+            status = event.get("ResourceStatus") or event.get("HookStatus") or ""
             color = red if "FAILED" in status or "ROLLBACK" in status else (
                 green if status.endswith("COMPLETE") else dim)
             line = (f"  {event['Timestamp'].astimezone():%H:%M:%S} {color(status.ljust(24))} "
                     f"{event['LogicalResourceId']}")
-            if reason := event.get("ResourceStatusReason"):
+            if hook := event.get("HookType"):
+                line += dim(f" [{hook}]")
+            if reason := event_reason(event):
                 line += dim(f" - {reason}")
             print(line)
 
@@ -468,10 +526,16 @@ def main():
 
     if described["Status"] == "FAILED":
         reason = described.get("StatusReason", "")
+        no_changes = "didn't contain changes" in reason or "No updates" in reason
+        # Read the events first: discarding a CREATE change set deletes the shell
+        # stack they hang off, and with it the reason the change set failed.
+        failures = [] if no_changes else failed_events(cfn, change_set_id)
         discard_change_set(cfn, change_set_id, stack_name, is_create)
-        if "didn't contain changes" in reason or "No updates" in reason:
+        if no_changes:
             print(green(f"{stack_name} is already up to date."))
             return
+        print()
+        print_failures(failures)
         die(f"change set failed: {reason}")
 
     print_plan(stack_name, region, account, template_path,
