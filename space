@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""
+space - disk usage of each item in a directory, largest first.
+
+Runs one `du` per entry in parallel, so big trees finish faster than `du -sh *`.
+
+  space                 # current dir
+  space ~/Downloads     # another dir
+  space --limit 10      # top 10 only
+  space --hidden        # include dotfiles
+"""
+import argparse
+import os
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+
+def du_kb(path):
+    """Size of path in KB (as du reports it), or None if unreadable."""
+    r = subprocess.run(["du", "-sk", "--", path],
+                       capture_output=True, text=True)
+    try:
+        return int(r.stdout.split("\t", 1)[0])
+    except ValueError:
+        return None
+
+
+def human(kb):
+    size = float(kb)
+    for unit in ("K", "M", "G", "T"):
+        if size < 1024 or unit == "T":
+            return f"{size:.0f}{unit}" if size >= 10 or unit == "K" else f"{size:.1f}{unit}"
+        size /= 1024
+
+
+def main():
+    p = argparse.ArgumentParser(description="Disk usage per item, largest first.")
+    p.add_argument("dir", nargs="?", default=".", help="directory (default: .)")
+    p.add_argument("-n", "--limit", type=int, help="show only the top N rows")
+    p.add_argument("-a", "--hidden", action="store_true", help="include dotfiles")
+    p.add_argument("-j", "--jobs", type=int, default=(os.cpu_count() or 4) * 2,
+                   help="parallel du processes (default: 2x CPUs)")
+    args = p.parse_args()
+
+    try:
+        names = os.listdir(args.dir)
+    except OSError as e:
+        sys.exit(f"space: {e}")
+    if not args.hidden:
+        names = [n for n in names if not n.startswith(".")]
+    paths = [os.path.join(args.dir, n) for n in names]
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        sizes = list(pool.map(du_kb, paths))
+
+    rows = sorted(((s, n) for s, n in zip(sizes, names) if s is not None),
+                  reverse=True)
+    if args.limit is not None:
+        rows = rows[:args.limit]
+
+    try:
+        for kb, name in rows:
+            print(f"{human(kb):>6}\t{name}")
+    except BrokenPipeError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
