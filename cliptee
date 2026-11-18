@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""
+cliptee - Run a command or stream stdin, mirroring output to terminal in real time
+          while capturing clean text into the system clipboard buffer.
+
+Usage:
+    cliptee <command> [args...]
+    command | cliptee
+"""
+
+import fcntl
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import tty
+
+ANSI_ESCAPE_RE = re.compile(
+    r'\x1b(?:'
+    r'[@-Z\\-_]|'                      # 2-character escape sequences
+    r'\[[0-?]*[ -/]*[@-~]|'            # CSI sequences (colors, cursor, etc.)
+    r'\][^\x07\x1b]*(?:\x07|\x1b\\)|'  # OSC sequences
+    r'[_^P][^\x1b]*\x1b\\'             # APC, PM, DCS sequences
+    r')'
+)
+
+
+def strip_ansi(text: str) -> str:
+    """Strip ANSI escape codes from text."""
+    return ANSI_ESCAPE_RE.sub('', text)
+
+
+def copy_to_clipboard(text: str) -> None:
+    """Copy text to clipboard using the appropriate OS utility."""
+    for cmd in (['pbcopy'], ['wl-copy'], ['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input']):
+        if shutil.which(cmd[0]):
+            try:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                proc.communicate(input=text.encode('utf-8'))
+                return
+            except Exception:
+                pass
+
+def format_captured_output(chunks: list[bytes]) -> str:
+    """Join raw byte chunks, normalize line endings, and strip terminal escape codes."""
+    raw = b''.join(chunks).decode('utf-8', errors='replace')
+    normalized = raw.replace('\r\n', '\n').replace('\r', '\n')
+    return strip_ansi(normalized)
+
+
+
+def run_pipe_mode() -> int:
+    """Read from stdin and stream to stdout while buffering for clipboard."""
+    captured_chunks = []
+    try:
+        while True:
+            chunk = sys.stdin.buffer.read(4096)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+            captured_chunks.append(chunk)
+    except KeyboardInterrupt:
+        pass
+    except BrokenPipeError:
+        pass
+
+    if captured_chunks:
+        clean_text = format_captured_output(captured_chunks)
+        copy_to_clipboard(clean_text)
+
+    return 0
+
+
+def run_pty_mode(cmd_args: list[str]) -> int:
+    """
+    Run command inside a pseudo-terminal (PTY).
+    This preserves TTY features such as colors, cursor formatting, and stdout+stderr ordering.
+    """
+    stdin_is_atty = sys.stdin.isatty()
+    master, slave = pty.openpty()
+
+    if stdin_is_atty:
+        try:
+            ws = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b'\0' * 8)
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, ws)
+        except Exception:
+            pass
+
+        def sigwinch_handler(signum, frame):
+            try:
+                current_ws = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b'\0' * 8)
+                fcntl.ioctl(master, termios.TIOCSWINSZ, current_ws)
+            except Exception:
+                pass
+
+        signal.signal(signal.SIGWINCH, sigwinch_handler)
+
+    try:
+        proc = subprocess.Popen(
+            cmd_args,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            close_fds=True,
+            preexec_fn=os.setsid
+        )
+    except Exception as e:
+        os.close(slave)
+        os.close(master)
+        sys.stderr.write(f"cliptee: failed to execute '{cmd_args[0]}': {e}\n")
+        return 1
+
+    os.close(slave)
+
+    old_termios = None
+    if stdin_is_atty:
+        try:
+            old_termios = termios.tcgetattr(sys.stdin.fileno())
+            tty.setraw(sys.stdin.fileno())
+        except Exception:
+            old_termios = None
+
+    captured_chunks = []
+
+    try:
+        while True:
+            rlist = [master]
+            if stdin_is_atty:
+                rlist.append(sys.stdin.fileno())
+
+            try:
+                readable, _, _ = select.select(rlist, [], [])
+            except (select.error, OSError):
+                continue
+
+            if stdin_is_atty and sys.stdin.fileno() in readable:
+                try:
+                    data = os.read(sys.stdin.fileno(), 1024)
+                    if data:
+                        os.write(master, data)
+                except OSError:
+                    pass
+
+            if master in readable:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                os.write(sys.stdout.fileno(), data)
+                captured_chunks.append(data)
+    finally:
+        if old_termios:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_termios)
+            except Exception:
+                pass
+        try:
+            os.close(master)
+        except Exception:
+            pass
+
+    proc.wait()
+
+    if captured_chunks:
+        clean_text = format_captured_output(captured_chunks)
+        copy_to_clipboard(clean_text)
+
+    return proc.returncode
+
+
+def main() -> None:
+    args = sys.argv[1:]
+
+    if args:
+        if args[0] in ('-h', '--help'):
+            sys.stdout.write(
+                "Usage:\n"
+                "  cliptee <command> [args...]   Run command with real-time output and copy to clipboard\n"
+                "  <command> | cliptee           Read piped output and copy to clipboard\n"
+            )
+            sys.exit(0)
+        sys.exit(run_pty_mode(args))
+
+    if not sys.stdin.isatty():
+        sys.exit(run_pipe_mode())
+
+    sys.stdout.write(
+        "Usage:\n"
+        "  cliptee <command> [args...]   Run command with real-time output and copy to clipboard\n"
+        "  <command> | cliptee           Read piped output and copy to clipboard\n"
+    )
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
+
