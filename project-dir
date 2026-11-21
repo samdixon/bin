@@ -102,16 +102,11 @@ list_projects() {
     -mindepth 1 \
     -maxdepth "$depth" \
     \( \
-      -name .git \
-      -o -name .hg \
-      -o -name .svn \
+      -name '.*' \
       -o -name node_modules \
-      -o -name .venv \
+      -o -name __MACOSX \
       -o -name venv \
       -o -name __pycache__ \
-      -o -name .terraform \
-      -o -name .serverless \
-      -o -name .next \
       -o -name dist \
       -o -name build \
       -o -name target \
